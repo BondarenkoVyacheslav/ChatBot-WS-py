@@ -1,51 +1,114 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
-from fastapi.responses import JSONResponse
-import json
-from typing import Any
-from client import recognize_bytes
+# controller.py
+from fastapi import APIRouter, Request, UploadFile, File, Body, HTTPException
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from pydantic import BaseModel
+from typing import Any, Dict, List, Coroutine
+from uuid import uuid4
+from pathlib import Path
+
+from starlette.responses import FileResponse
+
+from config import STT_WS_URL, TTS_WS_URL
+
+from client.stt import recognize_bytes
+from client.tts import synthesize_speech
 
 router = APIRouter()
 
-# Симуляция broadcast-сендера (в Rust он рассылал сообщения всем клиентам через канал)
-# Здесь просто возвращаем ответ (или можно сохранить в очередь, если нужно)
-broadcast_messages = []
+# 1) POST /api/message
+class MessagePayload(BaseModel):
+    path: str
+    data: Dict[str, Any]
 
-
-@router.post("/upload")
-async def file_controller(file: UploadFile = File(...)) -> Any:
+@router.post("/message", summary="Обработка JSON-команды клиента")
+async def message_controller(
+    request: Request,
+    payload: MessagePayload = Body(...),
+) -> Any:
     """
-    Обработка загруженного WAV-файла и вызов STT-сервиса.
+    Аналог вашего message_controller:
+    - проверяет payload.path
+    - сохраняет в state.broadcast_messages
+    - возвращает echo или ошибку
+    """
+    path, data = payload.path, payload.data
+    if path == "/auth":
+        raise HTTPException(400, "UnresolvedMessageTypes")
+    if path == "/admin":
+        raise HTTPException(403, "Forbidden")
+    if path == "/message":
+        request.app.state.broadcast_messages.append(data)
+        return {"status": "ok", "echo": data}
+    raise HTTPException(400, "UnresolvedMessageTypes")
+
+
+# 2) POST /api/upload
+@router.post("/upload", summary="Обработка аудио-файла (STT)")
+async def file_controller(
+    request: Request,
+    file: UploadFile = File(...),
+) -> Any:
+    """
+    Аналог вашего file_controller:
+    - принимает WAV/MP3
+    - вызывает recognize_bytes
+    - сохраняет текст в state.broadcast_messages
+    - возвращает JSON {"text": "..."}
     """
     try:
-        file_bytes = await file.read()
-        result_text = await recognize_bytes(file_bytes, "http://127.0.0.1:8002")  # HTTP вместо ws://
-        broadcast_messages.append(result_text)  # имитация рассылки
-        return {"text": result_text}
+        data = await file.read()
+        text = await recognize_bytes(data, STT_WS_URL)
+        request.app.state.broadcast_messages.append(text)
+        return {"text": text}
     except ValueError as e:
-        raise HTTPException(status_code=415, detail=str(e))
+        raise HTTPException(415, str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+        raise HTTPException(500, f"Internal error: {e}")
 
 
-@router.post("/message")
-async def message_controller(request: Request) -> Any:
+# 3) POST /api/synthesize
+class TextPayload(BaseModel):
+    text: str
+
+@router.post("/synthesize", summary="Генерация WAV-аудио (TTS)")
+async def tts_controller(
+    payload: TextPayload = Body(...),
+) -> FileResponse:
     """
-    Обработка JSON-команды клиента: { "path": ..., "data": ... }
+    - принимает JSON {"text": "..."}
+    - вызывает synthesize_speech
+    - возвращает WAV-аудио в ответе
     """
-    try:
-        payload = await request.json()
-        path = payload.get("path")
-        data = payload.get("data")
+    out_path = Path("/tmp") / f"{uuid4()}.wav"
+    await synthesize_speech(payload.text, TTS_WS_URL, str(out_path))
+    return FileResponse(out_path, media_type="audio/wav")
 
-        if path == "/auth":
-            raise HTTPException(status_code=400, detail="UnresolvedMessageTypes")
-        elif path == "/admin":
-            raise HTTPException(status_code=403, detail="Forbidden")
-        elif path == "/message":
-            # Эмуляция вызова test_call_all
-            broadcast_messages.append(json.dumps(data))
-            return JSONResponse(content={"status": "ok", "echo": data})
-        else:
-            raise HTTPException(status_code=400, detail="UnresolvedMessageTypes")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid message format: {e}")
+
+# 4) GET /api/messages
+@router.get("/messages", summary="Получить накопленные события")
+async def get_messages(request: Request) -> Any:
+    """
+    - возвращает и очищает request.app.state.broadcast_messages
+    - эмулирует поведение broadcast
+    """
+    msgs: List[Any] = request.app.state.broadcast_messages.copy()
+    request.app.state.broadcast_messages.clear()
+    return {"messages": msgs}
+
+
+# (Опционально) 5) SSE-поток на /api/events
+from fastapi.responses import EventSourceResponse
+import asyncio, json
+
+@router.get("/events", summary="SSE-стрим событий")
+async def events(request: Request):
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+            if request.app.state.broadcast_messages:
+                msg = request.app.state.broadcast_messages.pop(0)
+                yield f"data: {json.dumps(msg)}\n\n"
+            else:
+                await asyncio.sleep(0.5)
+    return EventSourceResponse(event_generator())
